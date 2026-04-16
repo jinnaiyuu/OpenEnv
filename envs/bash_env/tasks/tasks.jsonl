@@ -1,0 +1,2 @@
+{"task_id": "hello_world", "instruction": "Create a file named output.txt containing the exact text: Hello, World! Then submit the file contents as your answer.", "expected_answer": "Hello, World!"}
+{"task_id": "count_txt", "instruction": "Create two empty files named a.txt and b.txt in the working directory. Then submit the number of .txt files as your answer.", "expected_answer": "2"}
