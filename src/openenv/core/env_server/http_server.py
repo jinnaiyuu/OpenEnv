@@ -357,7 +357,16 @@ class HTTPEnvServer:
             factory_name = getattr(
                 self._env_factory, "__name__", str(self._env_factory)
             )
-            raise EnvironmentFactoryError(factory_name) from e
+            logging.exception(
+                "Environment factory %s failed to create instance", factory_name
+            )
+            raise EnvironmentFactoryError(
+                factory_name,
+                message=(
+                    f"Environment factory '{factory_name}' failed to create instance: "
+                    f"{type(e).__name__}: {e}"
+                ),
+            ) from e
 
         # Hold the MCP session open for the lifetime of this session,
         # matching the WebSocket path's AsyncExitStack pattern.  This

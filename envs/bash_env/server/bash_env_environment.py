@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 from pathlib import Path
@@ -26,6 +27,8 @@ _DEFAULT_TASKS_PATH = (
     Path(__file__).resolve().parent.parent / "tasks" / "tasks.jsonl"
 )
 
+logger = logging.getLogger(__name__)
+
 
 def _normalize_answer(text: str) -> str:
     return " ".join(text.strip().split()).casefold()
@@ -33,6 +36,7 @@ def _normalize_answer(text: str) -> str:
 
 def _load_tasks(tasks_path: Path) -> dict[str, dict[str, str]]:
     if not tasks_path.exists():
+        logger.error("BashEnv tasks file not found: %s", tasks_path)
         raise FileNotFoundError(f"Tasks file not found: {tasks_path}")
 
     tasks: dict[str, dict[str, str]] = {}
@@ -43,6 +47,9 @@ def _load_tasks(tasks_path: Path) -> dict[str, dict[str, str]]:
         try:
             data = json.loads(line)
         except json.JSONDecodeError as exc:
+            logger.exception(
+                "Invalid JSON in tasks file %s at line %s", tasks_path, idx
+            )
             raise ValueError(
                 f"Invalid JSON in tasks file {tasks_path} at line {idx}: {exc}"
             ) from exc
@@ -52,6 +59,12 @@ def _load_tasks(tasks_path: Path) -> dict[str, dict[str, str]]:
         expected_answer = data.get("expected_answer")
 
         if not task_id or not instruction or expected_answer is None:
+            logger.error(
+                "Invalid task entry in %s at line %s: %s",
+                tasks_path,
+                idx,
+                data,
+            )
             raise ValueError(
                 "Each task must include task_id, instruction, and expected_answer"
             )
@@ -62,6 +75,7 @@ def _load_tasks(tasks_path: Path) -> dict[str, dict[str, str]]:
         }
 
     if not tasks:
+        logger.error("No tasks loaded from %s", tasks_path)
         raise ValueError(f"No tasks loaded from {tasks_path}")
 
     return tasks
@@ -89,6 +103,14 @@ class BashEnvironment(Environment[BashAction, BashObservation, BashState]):
             command_timeout_s
             if command_timeout_s is not None
             else os.getenv("BASH_COMMAND_TIMEOUT_S", "20.0")
+        )
+
+        logger.debug(
+            "Initializing BashEnvironment (tasks_path=%s, output_dir=%s, timeout_s=%s, env_tasks_path=%s)",
+            self.tasks_path,
+            self.output_dir,
+            self.command_timeout_s,
+            env_tasks_path,
         )
 
         self._tasks = _load_tasks(self.tasks_path)
@@ -124,6 +146,13 @@ class BashEnvironment(Environment[BashAction, BashObservation, BashState]):
         workdir.mkdir(parents=True, exist_ok=True)
         self._workdir = workdir
 
+        logger.info(
+            "Reset BashEnvironment (task_id=%s, episode_id=%s, workdir=%s)",
+            self._task_id,
+            run_id,
+            workdir,
+        )
+
         self._state = BashState(
             episode_id=str(run_id),
             step_count=0,
@@ -158,6 +187,12 @@ class BashEnvironment(Environment[BashAction, BashObservation, BashState]):
         if self._workdir is None or self._task_id is None:
             raise RuntimeError("Bash Env not initialized. Call reset() first.")
 
+        logger.debug(
+            "Step BashEnvironment (task_id=%s, action_type=%s)",
+            self._task_id,
+            action.action_type,
+        )
+
         self._state.step_count += 1
         self._state.last_action_type = action.action_type
 
@@ -175,6 +210,11 @@ class BashEnvironment(Environment[BashAction, BashObservation, BashState]):
                     if action.timeout_s is not None
                     else (timeout_s or self.command_timeout_s)
                 )
+                logger.debug(
+                    "Executing command (timeout_s=%s): %s",
+                    timeout_value,
+                    action.command,
+                )
                 result = subprocess.run(
                     ["bash", "-lc", action.command],
                     cwd=str(self._workdir),
@@ -188,6 +228,7 @@ class BashEnvironment(Environment[BashAction, BashObservation, BashState]):
                 self._state.last_command = action.command
 
             elif action.action_type == "submit":
+                logger.debug("Submitting answer: %s", action.answer)
                 normalized_answer = _normalize_answer(action.answer)
                 normalized_expected = _normalize_answer(self._expected_answer)
                 reward = 1.0 if normalized_answer == normalized_expected else 0.0
@@ -195,6 +236,7 @@ class BashEnvironment(Environment[BashAction, BashObservation, BashState]):
                 metadata = {"correct": reward == 1.0}
 
             elif action.action_type == "close":
+                logger.debug("Closing BashEnvironment session")
                 done = True
                 output = "Closed Bash Env environment."
 
@@ -204,6 +246,7 @@ class BashEnvironment(Environment[BashAction, BashObservation, BashState]):
         except Exception as exc:  # pragma: no cover
             success = False
             error = str(exc)
+            logger.exception("BashEnvironment step failed: %s", exc)
 
         self._state.last_output = output
 
@@ -224,6 +267,7 @@ class BashEnvironment(Environment[BashAction, BashObservation, BashState]):
         return self._state
 
     def close(self) -> None:
+        logger.info("Closing BashEnvironment (task_id=%s)", self._task_id)
         self._workdir = None
         self._task_id = None
         self._instruction = ""
