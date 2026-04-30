@@ -28,7 +28,7 @@ _DEFAULT_TASKS_PATH = (
 )
 
 logger = logging.getLogger(__name__)
-
+logger.setLevel(logging.DEBUG)
 
 def _normalize_answer(text: str) -> str:
     return " ".join(text.strip().split()).casefold()
