@@ -32,8 +32,6 @@ class BashAction(Action):
     def _validate_required_fields(self) -> "BashAction":
         if self.action_type == "exec" and not self.command:
             raise ValueError("command is required for action_type='exec'")
-        if self.action_type == "submit" and not self.answer:
-            raise ValueError("answer is required for action_type='submit'")
         return self
 
 

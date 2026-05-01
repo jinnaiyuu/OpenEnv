@@ -14,9 +14,9 @@ tags:
 
 # Bash Env Environment
 
-Local terminal environment with task instructions and submit-style rewards.
+Local terminal environment with task instructions and script-evaluated rewards.
 Each episode provides an instruction and an empty working directory. The agent
-uses shell commands to work, then submits a final answer.
+uses shell commands to work, writes a solution script, then submits to run tests.
 
 ## Quick Start
 
@@ -27,10 +27,20 @@ env = BashEnv(base_url="http://localhost:8000")
 result = env.reset(task_id="hello_world")
 print(result.observation.instruction)
 
-result = env.step(BashAction(action_type="exec", command="printf 'Hello, World!' > output.txt"))
+result = env.step(
+  BashAction(
+    action_type="exec",
+    command="""
+cat > solve.sh << 'SH'
+#!/usr/bin/env bash
+printf 'Hello, World!'
+SH
+""",
+  )
+)
 print(result.observation.output)
 
-result = env.step(BashAction(action_type="submit", answer="Hello, World!"))
+result = env.step(BashAction(action_type="submit"))
 print(result.reward, result.done)
 
 env.close()
@@ -38,9 +48,19 @@ env.close()
 
 ## Task Format (JSONL)
 
-Each line in the tasks file defines one task:
+Each line in the tasks file defines one task. Prefer script-based evaluation
+with `script_names` and `test_cases`:
 
 ```json
+{
+  "task_id": "hello_world",
+  "instruction": "...",
+  "script_names": ["solve.sh", "solve.py"],
+  "test_cases": [{"input": "", "output": "Hello, World!"}]
+}
+
+Legacy string-matching tasks are still supported:
+
 {"task_id": "hello_world", "instruction": "...", "expected_answer": "..."}
 ```
 
@@ -49,7 +69,7 @@ Configure the tasks file with `BASH_TASKS_PATH`.
 ## Actions
 
 - `exec`: run a shell command in the episode workdir
-- `submit`: submit the final answer (case-insensitive match)
+- `submit`: run the solution script against hidden tests
 - `close`: end the session
 
 ## Environment Variables

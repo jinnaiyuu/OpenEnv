@@ -34,12 +34,42 @@ def _normalize_answer(text: str) -> str:
     return " ".join(text.strip().split()).casefold()
 
 
-def _load_tasks(tasks_path: Path) -> dict[str, dict[str, str]]:
+def _normalize_output(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.rstrip() for line in text.split("\n")]
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines)
+
+
+def _coerce_str(value: Any, field_name: str, tasks_path: Path, line: int) -> str:
+    if value is None:
+        raise ValueError(f"Missing {field_name} in tasks file {tasks_path} at line {line}")
+    return str(value)
+
+
+def _normalize_test_case(
+    test_case: dict[str, Any],
+    tasks_path: Path,
+    line: int,
+    index: int,
+) -> dict[str, str]:
+    if not isinstance(test_case, dict):
+        raise ValueError(
+            f"Invalid test_cases entry in {tasks_path} at line {line}: index {index}"
+        )
+    return {
+        "input": str(test_case.get("input", "")),
+        "output": _coerce_str(test_case.get("output"), "test_cases.output", tasks_path, line),
+    }
+
+
+def _load_tasks(tasks_path: Path) -> dict[str, dict[str, Any]]:
     if not tasks_path.exists():
         logger.error("BashEnv tasks file not found: %s", tasks_path)
         raise FileNotFoundError(f"Tasks file not found: {tasks_path}")
 
-    tasks: dict[str, dict[str, str]] = {}
+    tasks: dict[str, dict[str, Any]] = {}
     lines = tasks_path.read_text(encoding="utf-8").splitlines()
     for idx, line in enumerate(lines, start=1):
         if not line.strip():
@@ -57,8 +87,11 @@ def _load_tasks(tasks_path: Path) -> dict[str, dict[str, str]]:
         task_id = data.get("task_id")
         instruction = data.get("instruction")
         expected_answer = data.get("expected_answer")
+        script_name = data.get("script_name")
+        script_names = data.get("script_names")
+        test_cases = data.get("test_cases")
 
-        if not task_id or not instruction or expected_answer is None:
+        if not task_id or not instruction:
             logger.error(
                 "Invalid task entry in %s at line %s: %s",
                 tasks_path,
@@ -66,7 +99,38 @@ def _load_tasks(tasks_path: Path) -> dict[str, dict[str, str]]:
                 data,
             )
             raise ValueError(
-                "Each task must include task_id, instruction, and expected_answer"
+                "Each task must include task_id and instruction"
+            )
+
+        if test_cases is not None:
+            if not isinstance(test_cases, list) or not test_cases:
+                raise ValueError(
+                    f"test_cases must be a non-empty list in {tasks_path} at line {idx}"
+                )
+            normalized_cases = [
+                _normalize_test_case(case, tasks_path, idx, case_idx)
+                for case_idx, case in enumerate(test_cases, start=1)
+            ]
+            if script_names is None and script_name is not None:
+                script_names = [script_name]
+            if script_names is None:
+                script_names = ["solve.sh", "solve.py"]
+            if not isinstance(script_names, list) or not all(
+                isinstance(name, str) and name for name in script_names
+            ):
+                raise ValueError(
+                    f"script_names must be a list of non-empty strings in {tasks_path} at line {idx}"
+                )
+            tasks[str(task_id)] = {
+                "instruction": str(instruction),
+                "script_names": [str(name) for name in script_names],
+                "test_cases": normalized_cases,
+            }
+            continue
+
+        if expected_answer is None:
+            raise ValueError(
+                f"Each task must include expected_answer or test_cases (line {idx} in {tasks_path})"
             )
 
         tasks[str(task_id)] = {
@@ -119,6 +183,8 @@ class BashEnvironment(Environment[BashAction, BashObservation, BashState]):
         self._task_id: str | None = None
         self._instruction = ""
         self._expected_answer = ""
+        self._script_names: list[str] | None = None
+        self._test_cases: list[dict[str, str]] | None = None
         self._workdir: Path | None = None
 
     def reset(
@@ -139,7 +205,9 @@ class BashEnvironment(Environment[BashAction, BashObservation, BashState]):
 
         self._task_id = str(task_id)
         self._instruction = task["instruction"]
-        self._expected_answer = task["expected_answer"]
+        self._expected_answer = task.get("expected_answer", "")
+        self._script_names = task.get("script_names")
+        self._test_cases = task.get("test_cases")
 
         run_id = episode_id or uuid4().hex
         workdir = self.output_dir / f"{self._task_id}.{run_id}" / "workdir"
@@ -228,12 +296,16 @@ class BashEnvironment(Environment[BashAction, BashObservation, BashState]):
                 self._state.last_command = action.command
 
             elif action.action_type == "submit":
-                logger.debug("Submitting answer: %s", action.answer)
-                normalized_answer = _normalize_answer(action.answer)
-                normalized_expected = _normalize_answer(self._expected_answer)
-                reward = 1.0 if normalized_answer == normalized_expected else 0.0
-                done = True
-                metadata = {"correct": reward == 1.0}
+                if self._test_cases:
+                    reward, output, metadata = self._evaluate_script()
+                    done = True
+                else:
+                    logger.debug("Submitting answer: %s", action.answer)
+                    normalized_answer = _normalize_answer(action.answer)
+                    normalized_expected = _normalize_answer(self._expected_answer)
+                    reward = 1.0 if normalized_answer == normalized_expected else 0.0
+                    done = True
+                    metadata = {"correct": reward == 1.0}
 
             elif action.action_type == "close":
                 logger.debug("Closing BashEnvironment session")
@@ -272,3 +344,69 @@ class BashEnvironment(Environment[BashAction, BashObservation, BashState]):
         self._task_id = None
         self._instruction = ""
         self._expected_answer = ""
+        self._script_names = None
+        self._test_cases = None
+
+    def _evaluate_script(self) -> tuple[float, str, dict[str, Any]]:
+        if self._workdir is None:
+            raise RuntimeError("Bash Env not initialized. Call reset() first.")
+        if not self._test_cases:
+            raise RuntimeError("No test cases defined for this task.")
+
+        script_path = self._select_script_path()
+        if script_path is None:
+            names = ", ".join(self._script_names or [])
+            raise FileNotFoundError(
+                f"Expected script not found. Create one of: {names or 'solve.sh, solve.py'}"
+            )
+
+        results: list[dict[str, Any]] = []
+        all_passed = True
+        combined_output: list[str] = []
+
+        for idx, test_case in enumerate(self._test_cases, start=1):
+            run_result = subprocess.run(
+                self._script_command(script_path),
+                cwd=str(self._workdir),
+                input=test_case["input"],
+                capture_output=True,
+                text=True,
+                timeout=self.command_timeout_s,
+            )
+            stdout = run_result.stdout or ""
+            stderr = run_result.stderr or ""
+            passed = (
+                run_result.returncode == 0
+                and _normalize_output(stdout) == _normalize_output(test_case["output"])
+            )
+            all_passed = all_passed and passed
+            results.append(
+                {
+                    "index": idx,
+                    "passed": passed,
+                    "returncode": run_result.returncode,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                }
+            )
+            combined_output.append(
+                f"Test {idx}: {'PASS' if passed else 'FAIL'}"
+            )
+
+        return (1.0 if all_passed else 0.0, "\n".join(combined_output), {"correct": all_passed, "tests": results})
+
+    def _select_script_path(self) -> Path | None:
+        if self._workdir is None:
+            return None
+        if not self._script_names:
+            return None
+        for name in self._script_names:
+            candidate = self._workdir / name
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _script_command(self, script_path: Path) -> list[str]:
+        if script_path.suffix == ".py":
+            return ["python3", str(script_path)]
+        return ["bash", str(script_path)]
